@@ -1,0 +1,1132 @@
+{
+  "name": "NAHN Enhanced Pipeline v2.2 - Full Multi-Agent Architecture",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 24
+            }
+          ]
+        }
+      },
+      "id": "trigger-cron",
+      "name": "Daily Trigger (6 AM)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        100,
+        400
+      ],
+      "notes": "Runs daily at 6 AM to check for new publications and clinical trials"
+    },
+    {
+      "parameters": {},
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        100,
+        600
+      ],
+      "notes": "For testing and ad-hoc signal processing"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.NAHN_API_URL || 'http://localhost:8082' }}/health",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "health-check",
+      "name": "NAHN Health Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        300,
+        400
+      ],
+      "notes": "Verifies NAHN FastAPI server is running before processing"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "db",
+              "value": "pubmed"
+            },
+            {
+              "name": "term",
+              "value": "(neurosurgery[MeSH] OR \"brain surgery\" OR \"spine surgery\" OR \"craniotomy\" OR \"laminectomy\" OR \"shunt\" OR \"deep brain stimulation\" OR \"aneurysm clipping\" OR \"glioma resection\" OR \"meningioma\" OR \"hydrocephalus\") AND (randomized controlled trial[pt] OR meta-analysis[pt] OR systematic review[pt] OR \"propensity score\") AND (\"last 7 days\"[dp])"
+            },
+            {
+              "name": "retmode",
+              "value": "json"
+            },
+            {
+              "name": "retmax",
+              "value": "100"
+            },
+            {
+              "name": "api_key",
+              "value": "={{ $env.NCBI_API_KEY || '' }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "pubmed-search",
+      "name": "PubMed Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        540,
+        300
+      ],
+      "notes": "Searches PubMed for recent neurosurgical RCTs, meta-analyses, and systematic reviews"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://clinicaltrials.gov/api/v2/studies",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "query.cond",
+              "value": "neurosurgery OR brain tumor OR glioblastoma OR spinal stenosis OR hydrocephalus OR intracranial aneurysm OR deep brain stimulation OR Parkinson surgery"
+            },
+            {
+              "name": "filter.overallStatus",
+              "value": "COMPLETED"
+            },
+            {
+              "name": "filter.resultsFirstPostDateRange",
+              "value": "MIN,MAX"
+            },
+            {
+              "name": "format",
+              "value": "json"
+            },
+            {
+              "name": "pageSize",
+              "value": "50"
+            },
+            {
+              "name": "sort",
+              "value": "LastUpdatePostDate:desc"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "ctgov-search",
+      "name": "ClinicalTrials.gov Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        540,
+        500
+      ],
+      "notes": "Searches for completed neurosurgical trials with results posted"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge and normalize results from both PubMed and ClinicalTrials.gov sources\nconst pubmedData = $('PubMed Search').item?.json || {};\nconst ctgovData = $('ClinicalTrials.gov Search').item?.json || {};\n\n// Extract PubMed IDs\nconst pmids = pubmedData?.esearchresult?.idlist || [];\n\n// Extract and normalize ClinicalTrials.gov studies\nconst ctStudies = (ctgovData?.studies || []).map(s => {\n  const id = s.protocolSection?.identificationModule;\n  const status = s.protocolSection?.statusModule;\n  const design = s.protocolSection?.designModule;\n  const outcomes = s.protocolSection?.outcomesModule;\n  const description = s.protocolSection?.descriptionModule;\n  \n  // Detect subspecialty from conditions\n  const conditions = (s.protocolSection?.conditionsModule?.conditions || []).join(' ').toLowerCase();\n  const subspecialties = [];\n  \n  if (conditions.includes('hydrocephalus') || conditions.includes('shunt') || conditions.includes('nph')) {\n    subspecialties.push('hydrocephalus');\n  }\n  if (conditions.includes('spine') || conditions.includes('cervical') || conditions.includes('lumbar') || conditions.includes('stenosis')) {\n    subspecialties.push('spine');\n  }\n  if (conditions.includes('aneurysm') || conditions.includes('avm') || conditions.includes('stroke') || conditions.includes('hemorrhage')) {\n    subspecialties.push('vascular');\n  }\n  if (conditions.includes('glioma') || conditions.includes('meningioma') || conditions.includes('tumor') || conditions.includes('gbm') || conditions.includes('glioblastoma')) {\n    subspecialties.push('oncology');\n  }\n  if (conditions.includes('parkinson') || conditions.includes('dbs') || conditions.includes('epilepsy') || conditions.includes('tremor')) {\n    subspecialties.push('functional');\n  }\n  if (conditions.includes('trauma') || conditions.includes('tbi') || conditions.includes('hematoma')) {\n    subspecialties.push('trauma');\n  }\n  \n  return {\n    source: 'clinicaltrials.gov',\n    nctId: id?.nctId || '',\n    title: id?.officialTitle || id?.briefTitle || '',\n    status: status?.overallStatus || '',\n    phase: design?.phases?.join(', ') || '',\n    enrollment: design?.enrollmentInfo?.count || 0,\n    studyType: design?.studyType || '',\n    primaryOutcome: outcomes?.primaryOutcomes?.[0]?.measure || '',\n    secondaryOutcomes: (outcomes?.secondaryOutcomes || []).map(o => o.measure).slice(0, 3),\n    lastUpdate: status?.lastUpdatePostDateStruct?.date || '',\n    briefSummary: description?.briefSummary?.substring(0, 500) || '',\n    subspecialties: subspecialties.length > 0 ? subspecialties : ['general']\n  };\n}).filter(s => s.nctId);\n\n// Create unified signal list\nconst signals = [];\n\n// Add PubMed signals (will be enriched later with abstract fetching)\nif (pmids.length > 0) {\n  signals.push({\n    source: 'pubmed',\n    ids: pmids,\n    count: pmids.length\n  });\n}\n\n// Add CT.gov signals\nctStudies.forEach(s => signals.push(s));\n\nreturn {\n  json: {\n    pubmed_count: pmids.length,\n    ctgov_count: ctStudies.length,\n    total_signals: pmids.length + ctStudies.length,\n    pubmed_ids: pmids,\n    ctgov_studies: ctStudies,\n    timestamp: new Date().toISOString(),\n    search_date: new Date().toISOString().split('T')[0]\n  }\n};"
+      },
+      "id": "merge-sources",
+      "name": "Merge & Normalize Sources",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        400
+      ],
+      "notes": "Combines PubMed and ClinicalTrials.gov results into unified format with subspecialty detection"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "check-signals",
+              "leftValue": "={{ $json.total_signals }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "check-results",
+      "name": "Has Results?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1000,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "db",
+              "value": "pubmed"
+            },
+            {
+              "name": "id",
+              "value": "={{ $json.pubmed_ids.slice(0, 25).join(',') }}"
+            },
+            {
+              "name": "retmode",
+              "value": "xml"
+            },
+            {
+              "name": "rettype",
+              "value": "abstract"
+            },
+            {
+              "name": "api_key",
+              "value": "={{ $env.NCBI_API_KEY || '' }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "id": "fetch-abstracts",
+      "name": "Fetch PubMed Abstracts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1220,
+        300
+      ],
+      "notes": "Fetches full abstracts for top 25 PubMed results"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse PubMed XML and score abstracts for relevance\nconst xmlData = $input.first().json.data || '';\nconst mergedData = $('Merge & Normalize Sources').item.json;\n\n// Simple XML parsing for abstracts\nconst articles = [];\nconst articleMatches = xmlData.match(/<PubmedArticle>([\\s\\S]*?)<\\/PubmedArticle>/g) || [];\n\narticleMatches.forEach(articleXml => {\n  const pmid = (articleXml.match(/<PMID[^>]*>(\\d+)<\\/PMID>/) || [])[1] || '';\n  const title = (articleXml.match(/<ArticleTitle>([\\s\\S]*?)<\\/ArticleTitle>/) || [])[1] || '';\n  const abstractText = (articleXml.match(/<AbstractText[^>]*>([\\s\\S]*?)<\\/AbstractText>/g) || [])\n    .map(t => t.replace(/<[^>]+>/g, '')).join(' ');\n  const journal = (articleXml.match(/<Title>([\\s\\S]*?)<\\/Title>/) || [])[1] || '';\n  const pubYear = (articleXml.match(/<Year>(\\d{4})<\\/Year>/) || [])[1] || '';\n  const pubType = (articleXml.match(/<PublicationType>([\\s\\S]*?)<\\/PublicationType>/g) || [])\n    .map(t => t.replace(/<[^>]+>/g, ''));\n  \n  // Calculate relevance score\n  let score = 0;\n  const lowerTitle = title.toLowerCase();\n  const lowerAbstract = abstractText.toLowerCase();\n  const combined = lowerTitle + ' ' + lowerAbstract;\n  \n  // Study design scoring (40 points max)\n  if (pubType.some(t => t.toLowerCase().includes('randomized')) || combined.includes('randomized controlled trial') || combined.includes('rct')) {\n    score += 40;\n  } else if (combined.includes('propensity score') || combined.includes('psm')) {\n    score += 30;\n  } else if (combined.includes('cohort') || combined.includes('retrospective')) {\n    score += 20;\n  } else if (combined.includes('meta-analysis') || combined.includes('systematic review')) {\n    score += 35;\n  }\n  \n  // Sample size estimation (20 points max)\n  const sampleMatch = combined.match(/(\\d+)\\s*(patients|subjects|participants)/i);\n  if (sampleMatch) {\n    const n = parseInt(sampleMatch[1]);\n    if (n >= 500) score += 20;\n    else if (n >= 200) score += 15;\n    else if (n >= 100) score += 10;\n    else if (n >= 50) score += 5;\n  }\n  \n  // Subspecialty detection (20 points max)\n  const subspecialties = [];\n  if (combined.includes('hydrocephalus') || combined.includes('shunt') || combined.includes('nph')) {\n    subspecialties.push('hydrocephalus');\n    score += 5;\n  }\n  if (combined.includes('spine') || combined.includes('cervical') || combined.includes('lumbar') || combined.includes('fusion')) {\n    subspecialties.push('spine');\n    score += 5;\n  }\n  if (combined.includes('aneurysm') || combined.includes('avm') || combined.includes('stroke') || combined.includes('hemorrhage')) {\n    subspecialties.push('vascular');\n    score += 5;\n  }\n  if (combined.includes('glioma') || combined.includes('meningioma') || combined.includes('tumor') || combined.includes('gbm')) {\n    subspecialties.push('oncology');\n    score += 5;\n  }\n  if (combined.includes('parkinson') || combined.includes('dbs') || combined.includes('epilepsy') || combined.includes('tremor')) {\n    subspecialties.push('functional');\n    score += 5;\n  }\n  if (combined.includes('trauma') || combined.includes('tbi') || combined.includes('hematoma')) {\n    subspecialties.push('trauma');\n    score += 5;\n  }\n  \n  // Journal impact (20 points max) - high-impact neurosurgery journals\n  const highImpactJournals = ['journal of neurosurgery', 'neurosurgery', 'lancet neurology', 'jama neurology', 'brain', 'annals of neurology', 'spine', 'world neurosurgery'];\n  if (highImpactJournals.some(j => journal.toLowerCase().includes(j))) {\n    score += 20;\n  }\n  \n  articles.push({\n    pmid,\n    title: title.replace(/<[^>]+>/g, ''),\n    abstract: abstractText.substring(0, 1000),\n    journal,\n    year: pubYear,\n    publicationTypes: pubType,\n    subspecialties: subspecialties.length > 0 ? subspecialties : ['general'],\n    relevanceScore: Math.min(score, 100),\n    source: 'pubmed'\n  });\n});\n\n// Sort by relevance score\narticles.sort((a, b) => b.relevanceScore - a.relevanceScore);\n\nreturn {\n  json: {\n    ...mergedData,\n    scored_articles: articles,\n    high_relevance_count: articles.filter(a => a.relevanceScore >= 50).length,\n    total_scored: articles.length\n  }\n};"
+      },
+      "id": "parse-score",
+      "name": "Parse & Score Abstracts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        300
+      ],
+      "notes": "Parses PubMed XML and calculates multi-factor relevance scores"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "check-high-relevance",
+              "leftValue": "={{ $json.high_relevance_count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "high-relevance-check",
+      "name": "High Relevance?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1660,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare high-relevance signals for NAHN API processing\nconst data = $input.first().json;\nconst highRelevanceArticles = data.scored_articles.filter(a => a.relevanceScore >= 50);\nconst ctgovStudies = data.ctgov_studies || [];\n\n// Combine high-relevance PubMed articles and CT.gov studies\nconst signals = [];\n\nhighRelevanceArticles.forEach(article => {\n  signals.push({\n    signal_id: `pubmed_${article.pmid}`,\n    source: 'pubmed',\n    title: article.title,\n    abstract: article.abstract,\n    journal: article.journal,\n    year: article.year,\n    subspecialties: article.subspecialties,\n    relevance_score: article.relevanceScore,\n    pmid: article.pmid,\n    study_design: article.publicationTypes.join(', ')\n  });\n});\n\nctgovStudies.forEach(study => {\n  signals.push({\n    signal_id: `ctgov_${study.nctId}`,\n    source: 'clinicaltrials.gov',\n    title: study.title,\n    abstract: study.briefSummary,\n    nct_id: study.nctId,\n    subspecialties: study.subspecialties,\n    enrollment: study.enrollment,\n    phase: study.phase,\n    primary_outcome: study.primaryOutcome,\n    study_design: study.studyType\n  });\n});\n\nreturn signals.map(s => ({ json: s }));"
+      },
+      "id": "prepare-signals",
+      "name": "Prepare NAHN Signals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1880,
+        200
+      ],
+      "notes": "Prepares high-relevance signals for NAHN API evaluation"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "loop-signals",
+      "name": "Process Each Signal",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        2100,
+        200
+      ],
+      "notes": "Processes each signal individually through the NAHN pipeline"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.NAHN_API_URL || 'http://localhost:8082' }}/evaluate",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  title: $json.title,\n  abstract: $json.abstract || $json.briefSummary || '',\n  subspecialty: $json.subspecialties ? $json.subspecialties[0] : 'general',\n  study_design: $json.study_design || 'unknown',\n  sample_size: $json.enrollment || 0,\n  source: $json.source,\n  pmid: $json.pmid || null,\n  nct_id: $json.nct_id || null\n}) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "nahn-evaluate",
+      "name": "NAHN API Evaluate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2320,
+        200
+      ],
+      "notes": "Sends signal to NAHN FastAPI for full evaluation including method recommendation, journal targeting, and subgroup detection"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "check-api-success",
+              "leftValue": "={{ $json.success !== false }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "api-success-check",
+      "name": "API Success?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2540,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.NAHN_API_URL || 'http://localhost:8082' }}/deep-research-multi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $env.OPENAI_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  signal_id: $('Process Each Signal').item.json.signal_id,\n  title: $('Process Each Signal').item.json.title,\n  abstract: $('Process Each Signal').item.json.abstract,\n  subspecialty: $json.subspecialty || 'general',\n  recommended_methods: $json.recommended_methods || [],\n  research_depth: 'comprehensive',\n  include_citations: true,\n  max_sources: 50\n}) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "deep-research",
+      "name": "Deep Research Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2760,
+        100
+      ],
+      "notes": "Calls multi-agent deep research (MiniMax M2.1 -> OpenAI -> Gemini fallback chain)"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.NAHN_API_URL || 'http://localhost:8082' }}/snowball",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  signal_id: $('Process Each Signal').item.json.signal_id,\n  seed_pmids: $json.cited_pmids || [],\n  seed_dois: $json.cited_dois || [],\n  max_depth: 2,\n  max_papers_per_level: 20,\n  relevance_threshold: 0.6\n}) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "id": "snowball-search",
+      "name": "Backward Snowballing",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2980,
+        100
+      ],
+      "notes": "Performs backward snowballing using Semantic Scholar API to expand literature search"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.NAHN_API_URL || 'http://localhost:8082' }}/exa-research",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Exa-Api-Key",
+              "value": "={{ $env.EXA_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  signal_id: $('Process Each Signal').item.json.signal_id,\n  query: $('Process Each Signal').item.json.title,\n  subspecialty: $json.subspecialty || 'general',\n  search_type: 'neural',\n  num_results: 30,\n  include_domains: ['pubmed.ncbi.nlm.nih.gov', 'ncbi.nlm.nih.gov', 'cochranelibrary.com', 'jamanetwork.com', 'thelancet.com', 'nejm.org'],\n  output_schema: {\n    type: 'object',\n    properties: {\n      related_studies: { type: 'array' },\n      methodology_insights: { type: 'string' },\n      gap_analysis: { type: 'string' }\n    }\n  }\n}) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "exa-research",
+      "name": "Exa Semantic Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3200,
+        100
+      ],
+      "notes": "Uses Exa API for neural semantic search to find related studies and methodology insights"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge results from Deep Research, Snowballing, and Exa Search\nconst originalSignal = $('Process Each Signal').item.json;\nconst nahnEval = $('NAHN API Evaluate').item.json;\nconst deepResearch = $('Deep Research Agent').item?.json || {};\nconst snowball = $('Backward Snowballing').item?.json || {};\nconst exaSearch = $('Exa Semantic Search').item?.json || {};\n\n// Combine all findings\nconst enhancedSignal = {\n  // Original signal data\n  signal_id: originalSignal.signal_id,\n  source: originalSignal.source,\n  title: originalSignal.title,\n  abstract: originalSignal.abstract,\n  pmid: originalSignal.pmid,\n  nct_id: originalSignal.nct_id,\n  \n  // NAHN evaluation results\n  subspecialty: nahnEval.subspecialty,\n  relevance_score: nahnEval.relevance_score || originalSignal.relevance_score,\n  recommended_methods: nahnEval.recommended_methods || [],\n  target_journals: nahnEval.target_journals || [],\n  subgroups: nahnEval.subgroups || [],\n  spinoff_opportunities: nahnEval.spinoff_opportunities || [],\n  network_validation: nahnEval.network_validation || {},\n  \n  // Deep Research synthesis\n  deep_research: {\n    comprehensive_report: deepResearch.report || '',\n    citations: deepResearch.citations || [],\n    key_findings: deepResearch.key_findings || [],\n    methodology_recommendations: deepResearch.methodology_recommendations || [],\n    evidence_gaps: deepResearch.evidence_gaps || []\n  },\n  \n  // Snowballing results\n  snowball_expansion: {\n    additional_papers: snowball.papers || [],\n    total_expanded: snowball.total_papers || 0,\n    citation_network: snowball.network || {},\n    key_references: snowball.key_references || []\n  },\n  \n  // Exa semantic search results\n  semantic_search: {\n    related_studies: exaSearch.related_studies || [],\n    methodology_insights: exaSearch.methodology_insights || '',\n    gap_analysis: exaSearch.gap_analysis || '',\n    search_quality: exaSearch.search_quality || 0\n  },\n  \n  // Metadata\n  processed_at: new Date().toISOString(),\n  pipeline_version: '2.0.0',\n  enhancement_layers: ['deep_research', 'snowballing', 'semantic_search']\n};\n\n// Calculate enhanced priority score\nlet priorityScore = nahnEval.relevance_score || 50;\n\n// Boost for comprehensive deep research\nif (deepResearch.report && deepResearch.report.length > 1000) {\n  priorityScore += 10;\n}\n\n// Boost for successful snowballing\nif (snowball.total_papers > 10) {\n  priorityScore += 5;\n}\n\n// Boost for strong semantic matches\nif (exaSearch.related_studies && exaSearch.related_studies.length > 5) {\n  priorityScore += 5;\n}\n\nenhancedSignal.enhanced_priority_score = Math.min(priorityScore, 100);\n\nreturn { json: enhancedSignal };"
+      },
+      "id": "merge-research",
+      "name": "Merge Research Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3420,
+        100
+      ],
+      "notes": "Combines results from Deep Research, Snowballing, and Exa Search into unified enhanced signal"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format comprehensive notification with all research layers\nconst signal = $input.first().json;\n\n// Build rich email HTML\nconst emailHtml = `\n<div style=\"font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto;\">\n  <div style=\"background: linear-gradient(135deg, #1a365d 0%, #2d5a87 100%); color: white; padding: 20px; border-radius: 8px 8px 0 0;\">\n    <h1 style=\"margin: 0;\">\ud83e\udde0 NAHN Enhanced Signal Alert</h1>\n    <p style=\"margin: 5px 0 0 0; opacity: 0.9;\">Neurosurgical Automated High-impact Network v2.0</p>\n  </div>\n  \n  <div style=\"background: #f8fafc; padding: 20px; border: 1px solid #e2e8f0;\">\n    <h2 style=\"color: #1a365d; margin-top: 0;\">${signal.title}</h2>\n    \n    <div style=\"display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px;\">\n      <span style=\"background: #3182ce; color: white; padding: 4px 12px; border-radius: 20px; font-size: 12px;\">\n        ${signal.subspecialty}\n      </span>\n      <span style=\"background: ${signal.enhanced_priority_score >= 70 ? '#38a169' : signal.enhanced_priority_score >= 50 ? '#d69e2e' : '#e53e3e'}; color: white; padding: 4px 12px; border-radius: 20px; font-size: 12px;\">\n        Priority: ${signal.enhanced_priority_score}/100\n      </span>\n      <span style=\"background: #805ad5; color: white; padding: 4px 12px; border-radius: 20px; font-size: 12px;\">\n        ${signal.source}\n      </span>\n    </div>\n    \n    <div style=\"background: white; padding: 15px; border-radius: 8px; margin-bottom: 15px;\">\n      <h3 style=\"color: #2d3748; margin-top: 0;\">\ud83d\udcca Recommended Methods</h3>\n      <ul style=\"margin: 0; padding-left: 20px;\">\n        ${(signal.recommended_methods || []).slice(0, 5).map(m => `<li>${m.method || m}: ${m.rationale || 'Recommended based on study characteristics'}</li>`).join('')}\n      </ul>\n    </div>\n    \n    <div style=\"background: white; padding: 15px; border-radius: 8px; margin-bottom: 15px;\">\n      <h3 style=\"color: #2d3748; margin-top: 0;\">\ud83d\udcda Target Journals</h3>\n      <ul style=\"margin: 0; padding-left: 20px;\">\n        ${(signal.target_journals || []).slice(0, 5).map(j => `<li><strong>${j.name || j}</strong> (IF: ${j.impact_factor || 'N/A'})</li>`).join('')}\n      </ul>\n    </div>\n    \n    ${signal.deep_research?.comprehensive_report ? `\n    <div style=\"background: #edf2f7; padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #3182ce;\">\n      <h3 style=\"color: #2d3748; margin-top: 0;\">\ud83d\udd2c Deep Research Synthesis</h3>\n      <p style=\"margin: 0; white-space: pre-wrap;\">${signal.deep_research.comprehensive_report.substring(0, 1500)}...</p>\n      <p style=\"margin: 10px 0 0 0; font-size: 12px; color: #718096;\">Citations: ${signal.deep_research.citations?.length || 0} sources</p>\n    </div>\n    ` : ''}\n    \n    ${signal.snowball_expansion?.total_expanded > 0 ? `\n    <div style=\"background: #faf5ff; padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #805ad5;\">\n      <h3 style=\"color: #2d3748; margin-top: 0;\">\ud83d\udd17 Snowball Expansion</h3>\n      <p style=\"margin: 0;\">Found <strong>${signal.snowball_expansion.total_expanded}</strong> additional related papers through backward snowballing.</p>\n      ${signal.snowball_expansion.key_references?.length > 0 ? `\n      <p style=\"margin: 10px 0 0 0;\"><strong>Key References:</strong></p>\n      <ul style=\"margin: 5px 0 0 0; padding-left: 20px;\">\n        ${signal.snowball_expansion.key_references.slice(0, 3).map(r => `<li>${r.title || r}</li>`).join('')}\n      </ul>\n      ` : ''}\n    </div>\n    ` : ''}\n    \n    ${signal.semantic_search?.gap_analysis ? `\n    <div style=\"background: #fffaf0; padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #dd6b20;\">\n      <h3 style=\"color: #2d3748; margin-top: 0;\">\ud83c\udfaf Evidence Gap Analysis</h3>\n      <p style=\"margin: 0;\">${signal.semantic_search.gap_analysis}</p>\n    </div>\n    ` : ''}\n    \n    <div style=\"background: white; padding: 15px; border-radius: 8px;\">\n      <h3 style=\"color: #2d3748; margin-top: 0;\">\ud83d\udc65 Subgroup Opportunities</h3>\n      <ul style=\"margin: 0; padding-left: 20px;\">\n        ${(signal.subgroups || []).slice(0, 5).map(s => `<li>${s.name || s}: ${s.rationale || ''}</li>`).join('')}\n      </ul>\n    </div>\n  </div>\n  \n  <div style=\"background: #1a365d; color: white; padding: 15px; border-radius: 0 0 8px 8px; text-align: center;\">\n    <p style=\"margin: 0; font-size: 12px;\">NAHN Enhanced Pipeline v2.0 | Processed: ${signal.processed_at}</p>\n    <p style=\"margin: 5px 0 0 0; font-size: 11px; opacity: 0.8;\">Enhancement Layers: ${signal.enhancement_layers?.join(', ') || 'standard'}</p>\n  </div>\n</div>\n`;\n\n// Build Slack blocks\nconst slackBlocks = [\n  {\n    type: 'header',\n    text: {\n      type: 'plain_text',\n      text: '\ud83e\udde0 NAHN Enhanced Signal Alert',\n      emoji: true\n    }\n  },\n  {\n    type: 'section',\n    text: {\n      type: 'mrkdwn',\n      text: `*${signal.title}*`\n    }\n  },\n  {\n    type: 'context',\n    elements: [\n      {\n        type: 'mrkdwn',\n        text: `\ud83d\udccd *Subspecialty:* ${signal.subspecialty} | \ud83d\udcca *Priority:* ${signal.enhanced_priority_score}/100 | \ud83d\udd2c *Source:* ${signal.source}`\n      }\n    ]\n  },\n  {\n    type: 'divider'\n  },\n  {\n    type: 'section',\n    fields: [\n      {\n        type: 'mrkdwn',\n        text: `*Recommended Methods:*\\n${(signal.recommended_methods || []).slice(0, 3).map(m => `\u2022 ${m.method || m}`).join('\\n')}`\n      },\n      {\n        type: 'mrkdwn',\n        text: `*Target Journals:*\\n${(signal.target_journals || []).slice(0, 3).map(j => `\u2022 ${j.name || j}`).join('\\n')}`\n      }\n    ]\n  }\n];\n\nif (signal.deep_research?.key_findings?.length > 0) {\n  slackBlocks.push({\n    type: 'section',\n    text: {\n      type: 'mrkdwn',\n      text: `*\ud83d\udd2c Key Findings from Deep Research:*\\n${signal.deep_research.key_findings.slice(0, 3).map(f => `\u2022 ${f}`).join('\\n')}`\n    }\n  });\n}\n\nif (signal.snowball_expansion?.total_expanded > 0) {\n  slackBlocks.push({\n    type: 'context',\n    elements: [\n      {\n        type: 'mrkdwn',\n        text: `\ud83d\udd17 *Snowball Expansion:* Found ${signal.snowball_expansion.total_expanded} additional related papers`\n      }\n    ]\n  });\n}\n\nslackBlocks.push({\n  type: 'context',\n  elements: [\n    {\n      type: 'mrkdwn',\n      text: `_NAHN Enhanced Pipeline v2.0 | ${signal.processed_at}_`\n    }\n  ]\n});\n\nreturn {\n  json: {\n    ...signal,\n    email_html: emailHtml,\n    email_subject: `[NAHN v2] ${signal.subspecialty}: ${signal.title.substring(0, 60)}...`,\n    slack_blocks: slackBlocks\n  }\n};"
+      },
+      "id": "format-notification",
+      "name": "Format Enhanced Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3640,
+        100
+      ],
+      "notes": "Formats comprehensive notification with all research layers for email and Slack"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build final notification payloads\nconst signal = $input.first().json;\n\nreturn {\n  json: {\n    email: {\n      to: '{{ $env.NOTIFICATION_EMAIL }}',\n      subject: signal.email_subject,\n      html: signal.email_html\n    },\n    slack: {\n      channel: '{{ $env.SLACK_CHANNEL || \"#nahn-alerts\" }}',\n      blocks: signal.slack_blocks\n    },\n    signal: signal\n  }\n};"
+      },
+      "id": "build-notifications",
+      "name": "Build Notifications",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3860,
+        100
+      ],
+      "notes": "Prepares final notification payloads for email and Slack"
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.email.to }}",
+        "subject": "={{ $json.email.subject }}",
+        "emailType": "html",
+        "html": "={{ $json.email.html }}",
+        "options": {}
+      },
+      "id": "send-email",
+      "name": "Send Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        4080,
+        0
+      ],
+      "notes": "Sends comprehensive email notification with all research findings"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ blocks: $json.slack.blocks }) }}",
+        "options": {}
+      },
+      "id": "send-slack",
+      "name": "Send Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4080,
+        200
+      ],
+      "notes": "Sends Slack notification with research summary"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.NAHN_API_URL || 'http://localhost:8082' }}/signals/store",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.signal) }}",
+        "options": {}
+      },
+      "id": "store-signal",
+      "name": "Store Enhanced Signal",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4080,
+        400
+      ],
+      "notes": "Stores enhanced signal with all research layers for audit trail and future reference"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.NAHN_API_URL || 'http://localhost:8082' }}/prospero/generate",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  signal: $json.signal,\n  include_deep_research: true,\n  include_snowball_refs: true,\n  template_version: '2.0'\n}) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "generate-prospero",
+      "name": "Generate Enhanced PROSPERO",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4080,
+        600
+      ],
+      "notes": "Generates enhanced PROSPERO template with deep research findings and snowball references"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Log API failure for debugging\nconst error = $input.first().json;\nconsole.error('NAHN API Failure:', JSON.stringify(error));\n\nreturn {\n  json: {\n    error: true,\n    message: 'NAHN API evaluation failed',\n    details: error,\n    timestamp: new Date().toISOString()\n  }\n};"
+      },
+      "id": "log-failure",
+      "name": "Log API Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2760,
+        300
+      ],
+      "notes": "Logs API failures for debugging"
+    },
+    {
+      "parameters": {
+        "jsCode": "// No results found - log and exit gracefully\nreturn {\n  json: {\n    status: 'no_results',\n    message: 'No new signals found in this search cycle',\n    timestamp: new Date().toISOString()\n  }\n};"
+      },
+      "id": "no-results",
+      "name": "No Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1220,
+        500
+      ],
+      "notes": "Handles case when no new signals are found"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Low relevance - log and skip processing\nreturn {\n  json: {\n    status: 'low_relevance',\n    message: 'No high-relevance signals found in this batch',\n    total_scored: $json.total_scored,\n    high_relevance_count: $json.high_relevance_count,\n    timestamp: new Date().toISOString()\n  }\n};"
+      },
+      "id": "low-relevance",
+      "name": "Low Relevance",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1880,
+        400
+      ],
+      "notes": "Handles case when no high-relevance signals are found"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Aggregate daily summary\nconst allSignals = $items('Store Enhanced Signal').map(item => item.json);\n\nconst summary = {\n  date: new Date().toISOString().split('T')[0],\n  total_signals_processed: allSignals.length,\n  by_subspecialty: {},\n  by_source: {},\n  high_priority_count: 0,\n  deep_research_count: 0,\n  snowball_expanded_count: 0,\n  average_priority_score: 0\n};\n\nlet totalScore = 0;\n\nallSignals.forEach(s => {\n  // Count by subspecialty\n  const subspec = s.signal?.subspecialty || 'unknown';\n  summary.by_subspecialty[subspec] = (summary.by_subspecialty[subspec] || 0) + 1;\n  \n  // Count by source\n  const source = s.signal?.source || 'unknown';\n  summary.by_source[source] = (summary.by_source[source] || 0) + 1;\n  \n  // Count high priority\n  if (s.signal?.enhanced_priority_score >= 70) {\n    summary.high_priority_count++;\n  }\n  \n  // Count deep research\n  if (s.signal?.deep_research?.comprehensive_report) {\n    summary.deep_research_count++;\n  }\n  \n  // Count snowball expanded\n  if (s.signal?.snowball_expansion?.total_expanded > 0) {\n    summary.snowball_expanded_count++;\n  }\n  \n  totalScore += s.signal?.enhanced_priority_score || 0;\n});\n\nsummary.average_priority_score = allSignals.length > 0 ? Math.round(totalScore / allSignals.length) : 0;\n\nreturn { json: summary };"
+      },
+      "id": "daily-summary",
+      "name": "Daily Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4300,
+        200
+      ],
+      "notes": "Aggregates daily processing summary with enhancement layer statistics"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Test signal for iNPH (Idiopathic Normal Pressure Hydrocephalus)\nreturn {\n  json: {\n    signal_id: 'test_inph_001',\n    source: 'test',\n    title: 'Comparison of Ventriculoperitoneal Shunt vs Endoscopic Third Ventriculostomy for iNPH: A Randomized Controlled Trial',\n    abstract: 'Background: Idiopathic normal pressure hydrocephalus (iNPH) is a treatable cause of dementia in elderly patients. The optimal surgical treatment remains debated. Methods: We conducted a multicenter RCT comparing VP shunt (n=150) vs ETV (n=148) in patients with probable iNPH. Primary outcome was improvement in gait at 12 months. Results: VP shunt showed superior outcomes (72% vs 58% improvement, p=0.02). Complications were similar between groups. Conclusion: VP shunt remains the preferred treatment for iNPH.',\n    subspecialties: ['hydrocephalus'],\n    study_design: 'Randomized Controlled Trial',\n    enrollment: 298\n  }\n};"
+      },
+      "id": "test-inph",
+      "name": "Test Signal (iNPH)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2100,
+        600
+      ],
+      "notes": "Test signal for hydrocephalus subspecialty"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Test signal for Spine Surgery\nreturn {\n  json: {\n    signal_id: 'test_spine_001',\n    source: 'test',\n    title: 'Minimally Invasive vs Open Lumbar Fusion for Degenerative Spondylolisthesis: 5-Year Outcomes from a Propensity-Matched Cohort',\n    abstract: 'Purpose: To compare long-term outcomes of minimally invasive transforaminal lumbar interbody fusion (MIS-TLIF) versus open TLIF for degenerative spondylolisthesis. Methods: Propensity score matching was used to compare 245 MIS-TLIF and 245 open TLIF patients. Outcomes included ODI, VAS, fusion rates, and complications at 5 years. Results: MIS-TLIF showed equivalent fusion rates (94% vs 92%) with reduced blood loss and shorter hospital stay. Long-term functional outcomes were similar. Conclusions: MIS-TLIF offers comparable efficacy with reduced perioperative morbidity.',\n    subspecialties: ['spine'],\n    study_design: 'Propensity Score Matched Cohort',\n    enrollment: 490\n  }\n};"
+      },
+      "id": "test-spine",
+      "name": "Test Signal (Spine)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2100,
+        800
+      ],
+      "notes": "Test signal for spine subspecialty"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.NAHN_API_URL || 'http://localhost:8082' }}/deep-research-multi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  signal_id: $('Process Each Signal').item.json.signal_id,\n  title: $('Process Each Signal').item.json.title,\n  abstract: $('Process Each Signal').item.json.abstract,\n  subspecialty: $json.subspecialty || 'general',\n  recommended_methods: $json.recommended_methods || [],\n  research_depth: 'comprehensive',\n  include_citations: true,\n  max_sources: 50\n}) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "minimax-deep-research",
+      "name": "MiniMax Multi-Agent Research",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2760,
+        -100
+      ],
+      "notes": "Calls MiniMax M2.1 with interleaved thinking for deep research synthesis. Falls back to OpenAI/Gemini if unavailable."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.NAHN_API_URL || 'http://localhost:8082' }}/research-orchestrator",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ signal_id: $('Process Each Signal').item.json.signal_id, title: $('Process Each Signal').item.json.title, abstract: $('Process Each Signal').item.json.abstract, subspecialty: $json.subspecialty || 'general', recommended_methods: $json.recommended_methods || [], research_depth: 'comprehensive', include_citations: true, max_sources: 50 }) }}",
+        "options": {
+          "timeout": 600000
+        }
+      },
+      "id": "research-orchestrator",
+      "name": "Research Orchestrator (All Agents)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2760,
+        200
+      ],
+      "notes": "Runs ALL research agents in parallel: Multi-Agent Supervisor, MiniMax M2.1, OpenAI, Gemini. Combines results from all sources."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.NAHN_API_URL || 'http://localhost:8082' }}/multi-agent-research",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ signal_id: $('Process Each Signal').item.json.signal_id, title: $('Process Each Signal').item.json.title, abstract: $('Process Each Signal').item.json.abstract, subspecialty: $json.subspecialty || 'general', recommended_methods: $json.recommended_methods || [], max_sources: 50, parallel_searches: true, include_similar: true }) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "multi-agent-research",
+      "name": "Multi-Agent Deep Research",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2760,
+        400
+      ],
+      "notes": "dair-ai style multi-agent research: Supervisor (MiniMax M2.1) + Planning (Gemini) + Web Search (Exa)"
+    }
+  ],
+  "connections": {
+    "Daily Trigger (6 AM)": {
+      "main": [
+        [
+          {
+            "node": "NAHN Health Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "NAHN Health Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "NAHN Health Check": {
+      "main": [
+        [
+          {
+            "node": "PubMed Search",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "ClinicalTrials.gov Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PubMed Search": {
+      "main": [
+        [
+          {
+            "node": "Merge & Normalize Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ClinicalTrials.gov Search": {
+      "main": [
+        [
+          {
+            "node": "Merge & Normalize Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge & Normalize Sources": {
+      "main": [
+        [
+          {
+            "node": "Has Results?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Results?": {
+      "main": [
+        [
+          {
+            "node": "Fetch PubMed Abstracts",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch PubMed Abstracts": {
+      "main": [
+        [
+          {
+            "node": "Parse & Score Abstracts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Score Abstracts": {
+      "main": [
+        [
+          {
+            "node": "High Relevance?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "High Relevance?": {
+      "main": [
+        [
+          {
+            "node": "Prepare NAHN Signals",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Low Relevance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare NAHN Signals": {
+      "main": [
+        [
+          {
+            "node": "Process Each Signal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Each Signal": {
+      "main": [
+        [
+          {
+            "node": "NAHN API Evaluate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Daily Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "NAHN API Evaluate": {
+      "main": [
+        [
+          {
+            "node": "API Success?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "API Success?": {
+      "main": [
+        [
+          {
+            "node": "Deep Research Agent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log API Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deep Research Agent": {
+      "main": [
+        [
+          {
+            "node": "Backward Snowballing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Backward Snowballing": {
+      "main": [
+        [
+          {
+            "node": "Exa Semantic Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Exa Semantic Search": {
+      "main": [
+        [
+          {
+            "node": "Merge Research Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Research Results": {
+      "main": [
+        [
+          {
+            "node": "Format Enhanced Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Enhanced Notification": {
+      "main": [
+        [
+          {
+            "node": "Build Notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Notifications": {
+      "main": [
+        [
+          {
+            "node": "Send Email",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send Slack",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Store Enhanced Signal",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Generate Enhanced PROSPERO",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Test Signal (iNPH)": {
+      "main": [
+        [
+          {
+            "node": "NAHN API Evaluate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Test Signal (Spine)": {
+      "main": [
+        [
+          {
+            "node": "NAHN API Evaluate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log API Failure": {
+      "main": [
+        [
+          {
+            "node": "Process Each Signal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Enhanced Signal": {
+      "main": [
+        [
+          {
+            "node": "Process Each Signal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Enhanced PROSPERO": {
+      "main": [
+        [
+          {
+            "node": "Process Each Signal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "NAHN Signal Evaluation": {
+      "main": [
+        [
+          {
+            "node": "Research Orchestrator (All Agents)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Multi-Agent Deep Research",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  }
+}
